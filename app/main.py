@@ -13,12 +13,17 @@ from .schemas import (
     CalculationRequest,
     CalculationResult,
     CalculationSummary,
+    CapacityUpgradeResult,
     Loads,
 )
-from .solver import Device, solve
+from .solver import Device, solve, solve_capacity_upgrade
 
 _MESSAGE_FEASIBLE = "计算成功：已找到三相负载最大值与最小值之差最小的分配方案"
 _MESSAGE_INFEASIBLE = "无可行分配：不存在所有设备均接入且各相不超容量的方案"
+_MESSAGE_UPGRADE = (
+    "扩容建议：已在最小化三相扩容总量、再最小化单相最大扩容量的目标下，"
+    "找到使所有设备均接入的容量与分配方案"
+)
 
 
 @asynccontextmanager
@@ -135,4 +140,63 @@ def get_calculation(calculation_id: int) -> CalculationDetail:
         message=_MESSAGE_FEASIBLE if record["feasible"] else _MESSAGE_INFEASIBLE,
         assignments=assignments,
         devices=record["devices"],
+    )
+
+
+@app.post(
+    "/api/v1/calculations/{calculation_id}/capacity-upgrade",
+    response_model=CapacityUpgradeResult,
+    tags=["calculations"],
+)
+def capacity_upgrade(calculation_id: int) -> CapacityUpgradeResult:
+    """针对无可行分配的计算记录，给出最小扩容建议。
+
+    保持设备功率与允许相位不变，计算各相需要增加的非负整数容量及对应分配，
+    使所有设备接入；依次最小化三相扩容总量与单相最大扩容量，仍相同时取
+    按设备编号排序的相位序列字典序最小的方案。仅返回建议，原计算记录不变。
+
+    记录不存在返回 404；原记录已有可行分配返回 409。
+    """
+    record = db.get_calculation(calculation_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"计算记录不存在：id={calculation_id}",
+        )
+    if record["feasible"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"计算记录已有可行分配，无需扩容：id={calculation_id}",
+        )
+
+    devices = [
+        Device(
+            code=d["device_id"],
+            power=d["power"],
+            allowed=tuple(d["allowed_phases"]),
+        )
+        for d in record["devices"]
+    ]
+    capacities = {
+        "A": record["capacities"]["A"],
+        "B": record["capacities"]["B"],
+        "C": record["capacities"]["C"],
+    }
+    upgrade = solve_capacity_upgrade(devices, capacities)
+
+    assignments = [
+        AssignmentItem(device_id=code, phase=upgrade.assignment[code])
+        for code in sorted(upgrade.assignment)
+    ]
+    return CapacityUpgradeResult(
+        id=record["id"],
+        created_at=record["created_at"],
+        original_capacities=Loads(**upgrade.original_capacities),
+        capacity_upgrades=Loads(**upgrade.upgrades),
+        suggested_capacities=Loads(**upgrade.suggested_capacities),
+        total_upgrade=upgrade.total_upgrade,
+        max_upgrade=upgrade.max_upgrade,
+        assignments=assignments,
+        loads=Loads(**upgrade.loads),
+        message=_MESSAGE_UPGRADE,
     )

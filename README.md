@@ -10,6 +10,8 @@
 3. 不存在可行分配时，返回明确的 `feasible: false` 结果与说明信息。
 
 每次计算的**输入、分配结果与各相负载**均持久化到 SQLite，可随时查询历史记录。
+对于原容量下无可行分配的记录，还可通过扩容接口获取「各相最小扩容量 + 对应分配」
+建议（保持设备功率与允许相位不变，且不修改原记录）。
 
 ## 快速开始（一键启动）
 
@@ -47,6 +49,7 @@ docker compose up --build
 | `POST` | `/api/v1/calculations` | 创建一次排布计算，返回最优分配、各相负载与差值 |
 | `GET` | `/api/v1/calculations` | 查询历史计算记录摘要（支持 `limit` / `offset` 分页） |
 | `GET` | `/api/v1/calculations/{id}` | 查询单条记录详情（含原始输入设备与分配结果） |
+| `POST` | `/api/v1/calculations/{id}/capacity-upgrade` | 为「无可行分配」的记录给出最小扩容建议（原记录不变） |
 | `GET` | `/health` | 健康检查 |
 
 ### 请求示例
@@ -98,6 +101,68 @@ curl -X POST http://localhost:8000/api/v1/calculations \
 }
 ```
 
+## 容量扩容建议
+
+对于返回 `feasible: false` 的计算记录，可调用扩容接口。服务**保持设备功率与允许
+相位不变**，计算 A/B/C 各相需要增加的**非负整数容量**以及扩容后的设备分配，
+使所有设备都能接入。优化目标依次为：
+
+1. **三相扩容总量最小**（`total_upgrade`）；
+2. 总量相同时，**单相最大扩容量最小**（`max_upgrade`）；
+3. 仍相同时，取按设备编号排序的相位序列**字典序最小**的方案。
+
+接口只返回建议，**原计算记录不做任何修改**。记录不存在返回 `404`；
+原记录已有可行分配（无需扩容）返回 `409`。
+
+### 请求示例
+
+```bash
+# 先创建一条无可行分配的记录
+curl -X POST http://localhost:8000/api/v1/calculations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "capacities": {"A": 5, "B": 0, "C": 0},
+    "devices": [
+      {"id": "BIG", "power": 50, "allowed_phases": ["A", "B", "C"]},
+      {"id": "FIX", "power": 7, "allowed_phases": ["A"]}
+    ]
+  }'
+
+# 再对该记录请求扩容建议（假设记录 id 为 2）
+curl -X POST http://localhost:8000/api/v1/calculations/2/capacity-upgrade
+```
+
+### 响应示例
+
+```json
+{
+  "id": 2,
+  "created_at": "2026-09-24T08:01:00.000000+00:00",
+  "original_capacities": {"A": 5, "B": 0, "C": 0},
+  "capacity_upgrades": {"A": 2, "B": 50, "C": 0},
+  "suggested_capacities": {"A": 7, "B": 50, "C": 0},
+  "total_upgrade": 52,
+  "max_upgrade": 50,
+  "assignments": [
+    {"device_id": "BIG", "phase": "B"},
+    {"device_id": "FIX", "phase": "A"}
+  ],
+  "loads": {"A": 7, "B": 50, "C": 0},
+  "message": "扩容建议：已在最小化三相扩容总量、再最小化单相最大扩容量的目标下，找到使所有设备均接入的容量与分配方案"
+}
+```
+
+字段说明：
+
+| 字段 | 说明 |
+| --- | --- |
+| `original_capacities` | 原各相容量 |
+| `capacity_upgrades` | 各相需要增加的非负整数容量 |
+| `suggested_capacities` | 建议容量 = 原容量 + 扩容量 |
+| `total_upgrade` / `max_upgrade` | 三相扩容总量 / 单相最大扩容量 |
+| `assignments` | 建议容量下的设备相位分配（按设备编号排序） |
+| `loads` | 该分配下各相的实际负载（均不超过建议容量） |
+
 ### 输入校验规则
 
 - 设备数量 **1 ~ 12** 台，设备编号**唯一**且非空；
@@ -144,3 +209,9 @@ python3 -m unittest tests.test_solver  # 仅求解器测试（无第三方依赖
 「设备编号排序后的相位序列」字典序依次产生；仅在负载差值**严格更小**时更新最优解，
 同差值时自然保留字典序最小方案。配合容量约束剪枝与负载差值下界剪枝，
 12 台设备的最坏情形亦可在秒级内完成求解。
+
+**扩容建议**（`capacity-upgrade`）同样按设备编号排序、相位按 A→B→C 展开做 DFS，
+分两遍搜索：第一遍求三相扩容总量的最小值，第二遍在总量固定最小的方案中以
+`(单相最大扩容量, 相位序列)` 为键选出最优（即先最小化单相最大扩容，再取字典序
+最小）。搜索中利用「只允许单一相位的设备造成的被迫超载 + 自由设备功率扣除各相
+空闲容量」构造扩容总量下界进行剪枝，12 台设备的最坏情形亦可在数秒内完成。

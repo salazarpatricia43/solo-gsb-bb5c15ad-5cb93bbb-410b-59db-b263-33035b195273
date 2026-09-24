@@ -12,8 +12,11 @@ os.environ["DATABASE_PATH"] = os.path.join(_tmpdir, "test.db")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import db  # noqa: E402
 from app.main import app  # noqa: E402
 
+# 显式建表，兼容未通过 with 上下文触发 lifespan 的 TestClient 用法
+db.init_db()
 client = TestClient(app)
 
 VALID_PAYLOAD = {
@@ -136,3 +139,93 @@ def test_allowed_phases_deduplicated():
 
 def test_health():
     assert client.get("/health").json() == {"status": "ok"}
+
+
+INFEASIBLE_UPGRADE_PAYLOAD = {
+    "capacities": {"A": 5, "B": 0, "C": 0},
+    "devices": [
+        {"id": "BIG", "power": 50, "allowed_phases": ["A", "B", "C"]},
+        {"id": "FIX", "power": 7, "allowed_phases": ["A"]},
+    ],
+}
+
+
+def _create(payload):
+    return client.post("/api/v1/calculations", json=payload).json()
+
+
+def test_capacity_upgrade_success():
+    created = _create(INFEASIBLE_UPGRADE_PAYLOAD)
+    calc_id = created["id"]
+    assert created["feasible"] is False
+
+    resp = client.post(f"/api/v1/calculations/{calc_id}/capacity-upgrade")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == calc_id
+    assert body["original_capacities"] == {"A": 5, "B": 0, "C": 0}
+    # FIX 只能接 A：A 相负载至少 7；BIG(50) 若也放 A 则扩容 52，
+    # 总量最小为 BIG 放 B：扩 B 50，A 不扩（FIX=7 > 原容量 5 -> 还需扩 A 2）
+    assert body["capacity_upgrades"] == {"A": 2, "B": 50, "C": 0}
+    assert body["total_upgrade"] == 52
+    assert body["max_upgrade"] == 50
+    assert body["suggested_capacities"] == {"A": 7, "B": 50, "C": 0}
+    assert body["loads"] == {"A": 7, "B": 50, "C": 0}
+    assignments = {a["device_id"]: a["phase"] for a in body["assignments"]}
+    assert assignments == {"BIG": "B", "FIX": "A"}
+    # 分配按设备编号排序
+    assert [a["device_id"] for a in body["assignments"]] == ["BIG", "FIX"]
+    assert "扩容" in body["message"]
+
+
+def test_capacity_upgrade_404():
+    resp = client.post("/api/v1/calculations/999999/capacity-upgrade")
+    assert resp.status_code == 404
+
+
+def test_capacity_upgrade_409_when_feasible():
+    created = _create(VALID_PAYLOAD)
+    calc_id = created["id"]
+    assert created["feasible"] is True
+    resp = client.post(f"/api/v1/calculations/{calc_id}/capacity-upgrade")
+    assert resp.status_code == 409
+
+
+def test_capacity_upgrade_does_not_modify_record():
+    created = _create(INFEASIBLE_UPGRADE_PAYLOAD)
+    calc_id = created["id"]
+    client.post(f"/api/v1/calculations/{calc_id}/capacity-upgrade")
+
+    detail = client.get(f"/api/v1/calculations/{calc_id}").json()
+    # 原记录仍为无可行分配，容量/负载/分配均不变
+    assert detail["feasible"] is False
+    assert detail["capacities"] == {"A": 5, "B": 0, "C": 0}
+    assert detail["loads"] is None
+    assert detail["imbalance"] is None
+    assert detail["assignments"] == []
+    for device in detail["devices"]:
+        assert device["assigned_phase"] is None
+
+    # 再调一次结果确定且相同（幂等读操作）
+    again = client.post(f"/api/v1/calculations/{calc_id}/capacity-upgrade").json()
+    assert again["capacity_upgrades"] == {"A": 2, "B": 50, "C": 0}
+
+
+def test_capacity_upgrade_single_forced_phase():
+    payload = {
+        "capacities": {"A": 100, "B": 0, "C": 0},
+        "devices": [
+            {"id": "X1", "power": 50, "allowed_phases": ["A"]},
+            {"id": "X2", "power": 60, "allowed_phases": ["A"]},
+        ],
+    }
+    created = _create(payload)
+    assert created["feasible"] is False
+    body = client.post(
+        f"/api/v1/calculations/{created['id']}/capacity-upgrade"
+    ).json()
+    assert body["capacity_upgrades"] == {"A": 10, "B": 0, "C": 0}
+    assert body["suggested_capacities"] == {"A": 110, "B": 0, "C": 0}
+    assert body["loads"] == {"A": 110, "B": 0, "C": 0}
+    assert body["total_upgrade"] == 10
+    assert body["max_upgrade"] == 10

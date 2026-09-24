@@ -97,3 +97,18 @@ class CalculationDetail(CalculationResult):
     """计算记录详情（含原始输入）。"""
 
     devices: list[DeviceRecord]
+
+
+class CapacityUpgradeResult(BaseModel):
+    """容量扩容建议结果（原计算记录不做任何修改）。"""
+
+    id: int
+    created_at: str
+    original_capacities: Loads = Field(..., description="原各相容量")
+    capacity_upgrades: Loads = Field(..., description="各相需要增加的非负整数容量")
+    suggested_capacities: Loads = Field(..., description="扩容后的建议容量")
+    total_upgrade: int = Field(..., ge=0, description="三相扩容总量")
+    max_upgrade: int = Field(..., ge=0, description="单相最大扩容量")
+    assignments: list[AssignmentItem] = Field(..., description="扩容后的设备分配")
+    loads: Loads = Field(..., description="建议容量下各相的实际负载")
+    message: str

@@ -13,12 +13,17 @@ from .schemas import (
     CalculationRequest,
     CalculationResult,
     CalculationSummary,
+    CapacityUpgradeResponse,
     Loads,
 )
-from .solver import Device, solve
+from .solver import Device, solve, solve_capacity_upgrade
 
 _MESSAGE_FEASIBLE = "计算成功：已找到三相负载最大值与最小值之差最小的分配方案"
 _MESSAGE_INFEASIBLE = "无可行分配：不存在所有设备均接入且各相不超容量的方案"
+_MESSAGE_UPGRADE = (
+    "扩容建议：已在保持设备功率与允许相位不变的前提下，找到扩容总量最小、"
+    "单相最大扩容量最小的接入方案"
+)
 
 
 @asynccontextmanager
@@ -135,4 +140,55 @@ def get_calculation(calculation_id: int) -> CalculationDetail:
         message=_MESSAGE_FEASIBLE if record["feasible"] else _MESSAGE_INFEASIBLE,
         assignments=assignments,
         devices=record["devices"],
+    )
+
+
+@app.post(
+    "/api/v1/calculations/{calculation_id}/capacity-upgrade",
+    response_model=CapacityUpgradeResponse,
+    tags=["calculations"],
+)
+def capacity_upgrade(calculation_id: int) -> CapacityUpgradeResponse:
+    """为无可行分配的计算记录生成扩容建议。
+
+    保持设备功率与允许相位不变，计算各相需要增加的非负整数容量及对应分配，
+    使所有设备均可接入；优化目标依次为：最小化三相扩容总量、最小化单相最大扩容量、
+    取按设备编号排序后相位序列字典序最小的方案。
+
+    原计算记录不会被修改。记录不存在返回 ``404``；
+    原记录已有可行分配（无需扩容）返回 ``409``。
+    """
+    record = db.get_calculation(calculation_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"计算记录不存在：id={calculation_id}",
+        )
+    if record["feasible"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"原计算记录已有可行分配，无需扩容：id={calculation_id}",
+        )
+
+    devices = [
+        Device(
+            code=d["device_id"],
+            power=d["power"],
+            allowed=tuple(d["allowed_phases"]),
+        )
+        for d in record["devices"]
+    ]
+    result = solve_capacity_upgrade(devices, record["capacities"])
+
+    return CapacityUpgradeResponse(
+        id=record["id"],
+        message=_MESSAGE_UPGRADE,
+        original_capacities=Loads(**result.original_capacities),
+        additions=Loads(**result.additions),
+        suggested_capacities=Loads(**result.suggested_capacities),
+        assignments=[
+            AssignmentItem(device_id=code, phase=phase)
+            for code, phase in sorted(result.assignment.items())
+        ],
+        loads=Loads(**result.loads),
     )

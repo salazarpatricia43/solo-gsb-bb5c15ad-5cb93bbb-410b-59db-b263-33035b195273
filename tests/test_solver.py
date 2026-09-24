@@ -4,7 +4,7 @@ import itertools
 import random
 import unittest
 
-from app.solver import Device, solve
+from app.solver import Device, solve, solve_capacity_upgrade
 
 PHASES = ("A", "B", "C")
 
@@ -145,6 +145,119 @@ class SolveFuzzTest(unittest.TestCase):
         ordered = sorted(devices, key=lambda d: d.code)
         self.assertEqual(
             tuple(result.assignment[d.code] for d in ordered), expected[1]
+        )
+
+
+def brute_force_upgrade(devices, capacities):
+    """朴素全枚举参照实现：返回 (扩容总量, 单相最大扩容, 相位序列, 负载, 扩容量)。"""
+    ordered = sorted(devices, key=lambda d: d.code)
+    allowed = [tuple(p for p in PHASES if p in d.allowed) for d in ordered]
+    best = None
+    for combo in itertools.product(*allowed):
+        loads = {p: 0 for p in PHASES}
+        for device, phase in zip(ordered, combo):
+            loads[phase] += device.power
+        additions = {p: max(0, loads[p] - capacities[p]) for p in PHASES}
+        total = sum(additions.values())
+        maximum = max(additions.values())
+        key = (total, maximum, combo)
+        if best is None or key < best[0]:
+            best = (key, loads, additions)
+    return best
+
+
+class CapacityUpgradeTest(unittest.TestCase):
+    def test_single_device_expand_on_lex_smallest_phase(self):
+        result = solve_capacity_upgrade(
+            [Device("BIG", 50, PHASES)], {"A": 5, "B": 0, "C": 0}
+        )
+        self.assertEqual(result.original_capacities, {"A": 5, "B": 0, "C": 0})
+        self.assertEqual(result.additions, {"A": 45, "B": 0, "C": 0})
+        self.assertEqual(result.suggested_capacities, {"A": 50, "B": 0, "C": 0})
+        self.assertEqual(result.assignment, {"BIG": "A"})
+        self.assertEqual(result.loads, {"A": 50, "B": 0, "C": 0})
+
+    def test_total_capacity_bound_forces_addition(self):
+        # 原容量总和恰好等于总功率，但 A 相 100 放不下两台 60：需扩容 20
+        devices = [Device("D1", 60, PHASES), Device("D2", 60, PHASES)]
+        result = solve_capacity_upgrade(devices, {"A": 100, "B": 10, "C": 10})
+        self.assertEqual(result.additions, {"A": 20, "B": 0, "C": 0})
+        self.assertEqual(result.suggested_capacities, {"A": 120, "B": 10, "C": 10})
+        self.assertEqual(result.assignment, {"D1": "A", "D2": "A"})
+        self.assertEqual(result.loads, {"A": 120, "B": 0, "C": 0})
+
+    def test_minimize_total_then_max_then_lexicographic(self):
+        # 原容量全为 0、两台同功率设备：
+        # 总量最小为 20；最小最大扩容量为 10；字典序最小序列 (A, B)
+        devices = [Device("D2", 10, PHASES), Device("D1", 10, PHASES)]
+        result = solve_capacity_upgrade(devices, {"A": 0, "B": 0, "C": 0})
+        self.assertEqual(sum(result.additions.values()), 20)
+        self.assertEqual(max(result.additions.values()), 10)
+        self.assertEqual(result.additions, {"A": 10, "B": 10, "C": 0})
+        self.assertEqual(result.assignment, {"D1": "A", "D2": "B"})
+
+    def test_restricted_phases_preserved(self):
+        # D1 只允许 A 相，扩容只能落在 A 相
+        result = solve_capacity_upgrade(
+            [Device("D1", 50, ("A",))], {"A": 10, "B": 99, "C": 99}
+        )
+        self.assertEqual(result.additions, {"A": 40, "B": 0, "C": 0})
+
+    def test_suggested_capacities_cover_loads(self):
+        result = solve_capacity_upgrade(
+            [Device("D1", 30, PHASES), Device("D2", 40, ("B", "C"))],
+            {"A": 10, "B": 10, "C": 10},
+        )
+        for phase in PHASES:
+            self.assertGreaterEqual(result.suggested_capacities[phase], result.loads[phase])
+            self.assertEqual(
+                result.suggested_capacities[phase],
+                result.original_capacities[phase] + result.additions[phase],
+            )
+            self.assertGreaterEqual(result.additions[phase], 0)
+
+
+class CapacityUpgradeFuzzTest(unittest.TestCase):
+    """扩容求解与朴素全枚举参照实现做随机对拍。"""
+
+    def test_against_brute_force(self):
+        rng = random.Random(20260925)
+        for case in range(400):
+            n = rng.randint(1, 7)
+            devices = []
+            for i in range(n):
+                allowed = tuple(p for p in PHASES if rng.random() < 0.7) or ("A",)
+                devices.append(Device(f"DEV-{i}", rng.randint(1, 20), allowed))
+            capacities = {p: rng.randint(0, 60) for p in PHASES}
+
+            expected = brute_force_upgrade(devices, capacities)
+            result = solve_capacity_upgrade(devices, capacities)
+
+            (exp_total, exp_max, exp_combo), exp_loads, exp_additions = expected
+            self.assertEqual(
+                sum(result.additions.values()), exp_total, f"case {case}: 扩容总量不符"
+            )
+            self.assertEqual(
+                max(result.additions.values()), exp_max, f"case {case}: 最大扩容量不符"
+            )
+            self.assertEqual(result.additions, exp_additions, f"case {case}: 扩容量不符")
+            self.assertEqual(result.loads, exp_loads, f"case {case}: 负载不符")
+            ordered = sorted(devices, key=lambda d: d.code)
+            actual_combo = tuple(result.assignment[d.code] for d in ordered)
+            self.assertEqual(actual_combo, exp_combo, f"case {case}: 字典序方案不符")
+
+    def test_twelve_devices_performance(self):
+        devices = [Device(f"D{i:02d}", 2**i, PHASES) for i in range(12)]
+        result = solve_capacity_upgrade(
+            devices, {"A": 0, "B": 0, "C": 0}
+        )
+        expected = brute_force_upgrade(devices, {"A": 0, "B": 0, "C": 0})
+        (exp_total, exp_max, exp_combo), _exp_loads, _ = expected
+        self.assertEqual(sum(result.additions.values()), exp_total)
+        self.assertEqual(max(result.additions.values()), exp_max)
+        ordered = sorted(devices, key=lambda d: d.code)
+        self.assertEqual(
+            tuple(result.assignment[d.code] for d in ordered), exp_combo
         )
 
 

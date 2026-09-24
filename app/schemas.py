@@ -97,3 +97,15 @@ class CalculationDetail(CalculationResult):
     """计算记录详情（含原始输入）。"""
 
     devices: list[DeviceRecord]
+
+
+class CapacityUpgradeResponse(BaseModel):
+    """无可行分配记录的扩容建议结果。"""
+
+    id: int
+    message: str
+    original_capacities: Loads = Field(..., description="各相原容量")
+    additions: Loads = Field(..., description="各相需要增加的容量（非负整数）")
+    suggested_capacities: Loads = Field(..., description="各相建议容量（原容量 + 扩容量）")
+    assignments: list[AssignmentItem] = Field(..., description="建议的设备相位分配")
+    loads: Loads = Field(..., description="建议分配下各相的实际负载")

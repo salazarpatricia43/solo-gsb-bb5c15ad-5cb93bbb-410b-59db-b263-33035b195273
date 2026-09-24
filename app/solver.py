@@ -113,3 +113,103 @@ def solve(devices: Iterable[Device], capacities: dict[str, int]) -> SolveResult:
         loads=final_loads,
         imbalance=best_imbalance,
     )
+
+
+@dataclass(frozen=True)
+class CapacityUpgradeResult:
+    """扩容求解结果。"""
+
+    original_capacities: dict[str, int]  # 各相原容量
+    additions: dict[str, int]  # 各相扩容量（非负整数）
+    suggested_capacities: dict[str, int]  # 各相建议容量（原容量 + 扩容量）
+    assignment: dict[str, str]  # 设备编号 -> 相位
+    loads: dict[str, int]  # 相位 -> 实际负载
+
+
+def solve_capacity_upgrade(
+    devices: Iterable[Device], capacities: dict[str, int]
+) -> CapacityUpgradeResult:
+    """在保持设备功率与允许相位不变的前提下求解扩容方案。
+
+    每台设备仍须整体接入其允许集合中的一个相位；各相容量可增加非负整数。
+    优化目标依次为：
+
+    1. 最小化三相扩容总量；
+    2. 总量相同时，最小化单相最大扩容量；
+    3. 仍相同时，取按设备编号排序后的相位序列字典序最小的方案。
+
+    :param devices: 设备集合（编号唯一、功率为正整数、允许相位非空）。
+    :param capacities: 各相原容量，形如 {"A": int, "B": int, "C": int}。
+    :return: CapacityUpgradeResult；容量可任意增加，故始终存在方案。
+    """
+    ordered = sorted(devices, key=lambda d: d.code)
+    n = len(ordered)
+    powers = [d.power for d in ordered]
+    # 每个设备的可接入相位按 A/B/C 固定顺序排列，保证 DFS 按字典序枚举方案
+    allowed = [tuple(p for p in PHASES if p in d.allowed) for d in ordered]
+    caps = {p: capacities[p] for p in PHASES}
+
+    total_power = sum(powers)
+    original_total = sum(caps[p] for p in PHASES)
+
+    loads = {p: 0 for p in PHASES}
+    current: list[Optional[str]] = [None] * n
+
+    # 已固定的最优目标：(扩容总量, 单相最大扩容量)；首个可行解出现前为 None
+    best_total: Optional[int] = None
+    best_max: Optional[int] = None
+    best_assignment: Optional[list[str]] = None
+
+    def dfs(i: int) -> None:
+        nonlocal best_total, best_max, best_assignment
+
+        deficits = {p: max(0, loads[p] - caps[p]) for p in PHASES}
+        cur_total = sum(deficits.values())
+        cur_max = max(deficits.values())
+
+        # 扩容总量下界：既须补足当前各相超载，又须保证三相总容量不低于设备总功率
+        lb_total = max(cur_total, total_power - original_total, 0)
+        if best_total is not None and lb_total > best_total:
+            return  # 无论后续如何分配，扩容总量都不可能更优
+
+        # 单相最大扩容量下界：已产生的超载不可能回落
+        lb_max = cur_max
+        if best_total is not None and lb_total == best_total and lb_max >= best_max:
+            # 总量已无严格更优空间；
+            # 最大扩容量严格更大，或相同但当前前缀非全 A（完整序列字典序更大）
+            if lb_max > best_max or any(phase != PHASES[0] for phase in current[:i]):
+                return
+
+        if i == n:
+            # 叶子节点：lb_total == cur_total（无剩余设备），方案按 (总量, 最大量) 比较
+            if (
+                best_total is None
+                or (cur_total, cur_max) < (best_total, best_max)
+            ):
+                best_total = cur_total
+                best_max = cur_max
+                best_assignment = current.copy()
+            return
+
+        for phase in allowed[i]:
+            loads[phase] += powers[i]
+            current[i] = phase
+            dfs(i + 1)
+            loads[phase] -= powers[i]
+            current[i] = None
+
+    dfs(0)
+
+    final_loads = {p: 0 for p in PHASES}
+    for idx, phase in enumerate(best_assignment):
+        final_loads[phase] += powers[idx]
+    # 扩容量以最终负载相对原容量的缺口为准（未用到的容量无需扩容）
+    additions = {p: max(0, final_loads[p] - caps[p]) for p in PHASES}
+    assignment = {ordered[i].code: best_assignment[i] for i in range(n)}
+    return CapacityUpgradeResult(
+        original_capacities=dict(caps),
+        additions=additions,
+        suggested_capacities={p: caps[p] + additions[p] for p in PHASES},
+        assignment=assignment,
+        loads=final_loads,
+    )

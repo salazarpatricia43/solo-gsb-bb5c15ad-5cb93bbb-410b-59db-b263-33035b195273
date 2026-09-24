@@ -12,8 +12,11 @@ os.environ["DATABASE_PATH"] = os.path.join(_tmpdir, "test.db")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import db  # noqa: E402
 from app.main import app  # noqa: E402
 
+# 显式建表，避免不同 Starlette 版本下 TestClient 是否触发 lifespan 的差异
+db.init_db()
 client = TestClient(app)
 
 VALID_PAYLOAD = {
@@ -136,3 +139,77 @@ def test_allowed_phases_deduplicated():
 
 def test_health():
     assert client.get("/health").json() == {"status": "ok"}
+
+
+INFEASIBLE_PAYLOAD = {
+    "capacities": {"A": 5, "B": 0, "C": 0},
+    "devices": [
+        {"id": "BIG", "power": 50, "allowed_phases": ["A", "B", "C"]},
+    ],
+}
+
+
+def test_capacity_upgrade_infeasible_record():
+    created = client.post("/api/v1/calculations", json=INFEASIBLE_PAYLOAD).json()
+    calc_id = created["id"]
+
+    resp = client.post(f"/api/v1/calculations/{calc_id}/capacity-upgrade")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == calc_id
+    assert body["original_capacities"] == {"A": 5, "B": 0, "C": 0}
+    # 扩容 45 落在字典序最小的 A 相
+    assert body["additions"] == {"A": 45, "B": 0, "C": 0}
+    assert body["suggested_capacities"] == {"A": 50, "B": 0, "C": 0}
+    assert body["assignments"] == [{"device_id": "BIG", "phase": "A"}]
+    assert body["loads"] == {"A": 50, "B": 0, "C": 0}
+    assert "扩容" in body["message"]
+
+
+def test_capacity_upgrade_does_not_mutate_record():
+    created = client.post("/api/v1/calculations", json=INFEASIBLE_PAYLOAD).json()
+    calc_id = created["id"]
+
+    client.post(f"/api/v1/calculations/{calc_id}/capacity-upgrade")
+
+    detail = client.get(f"/api/v1/calculations/{calc_id}").json()
+    assert detail["feasible"] is False
+    assert detail["loads"] is None
+    assert detail["capacities"] == {"A": 5, "B": 0, "C": 0}
+    assert all(d["assigned_phase"] is None for d in detail["devices"])
+
+
+def test_capacity_upgrade_not_found():
+    resp = client.post("/api/v1/calculations/999999/capacity-upgrade")
+    assert resp.status_code == 404
+
+
+def test_capacity_upgrade_conflict_when_feasible():
+    created = client.post("/api/v1/calculations", json=VALID_PAYLOAD).json()
+    calc_id = created["id"]
+
+    resp = client.post(f"/api/v1/calculations/{calc_id}/capacity-upgrade")
+    assert resp.status_code == 409
+    # 冲突时原记录仍可正常查询
+    assert client.get(f"/api/v1/calculations/{calc_id}").status_code == 200
+
+
+def test_capacity_upgrade_total_then_max_then_lexicographic():
+    payload = {
+        "capacities": {"A": 0, "B": 0, "C": 0},
+        "devices": [
+            {"id": "D2", "power": 10, "allowed_phases": ["A", "B", "C"]},
+            {"id": "D1", "power": 10, "allowed_phases": ["A", "B", "C"]},
+        ],
+    }
+    created = client.post("/api/v1/calculations", json=payload).json()
+    resp = client.post(f"/api/v1/calculations/{created['id']}/capacity-upgrade")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["additions"] == {"A": 10, "B": 10, "C": 0}
+    assert body["suggested_capacities"] == {"A": 10, "B": 10, "C": 0}
+    assert body["assignments"] == [
+        {"device_id": "D1", "phase": "A"},
+        {"device_id": "D2", "phase": "B"},
+    ]
+    assert body["loads"] == {"A": 10, "B": 10, "C": 0}
